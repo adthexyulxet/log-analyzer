@@ -7,9 +7,12 @@ import html
 import csv
 import io
 import base64
+import re
+import json
 
 MAX_PRINT_COUNT = 10
 ICON_FILENAME = "my_icon.ico"
+CHART_FILENAME = "chart.js"
 
 BASE_TARGET_PHRASES = {
     "Installation finished successfully": "에이전트 설치 완료",
@@ -26,10 +29,10 @@ BASE_TARGET_PHRASES = {
     "Could not stop agent": "에이전트 중지 실패"
 }
 
-def get_icon_path():
+def get_resource_path(filename):
     if hasattr(sys, '_MEIPASS'):
-        return os.path.join(sys._MEIPASS, ICON_FILENAME)
-    return os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), ICON_FILENAME)
+        return os.path.join(sys._MEIPASS, filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 def set_window_icon(window, icon_path):
     try:
@@ -45,8 +48,10 @@ def show_custom_message(parent, title, message, icon_path):
     
     set_window_icon(dialog, icon_path)
     
-    dialog.grab_set()
     dialog.attributes('-topmost', True)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.grab_set()
     
     dialog.geometry("450x180")
     dialog.resizable(False, False)
@@ -56,23 +61,41 @@ def show_custom_message(parent, title, message, icon_path):
     y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
     dialog.geometry(f"+{x}+{y}")
 
-    msg_label = tk.Label(dialog, text=message, justify="center", padx=10, pady=15, wraplength=400)
-    msg_label.pack(expand=True, fill="both")
+    bottom_frame = tk.Frame(dialog)
+    bottom_frame.pack(side="bottom", pady=15)
     
-    btn = tk.Button(dialog, text="확인", command=dialog.destroy, width=10)
-    btn.pack(pady=10)
+    btn = tk.Button(bottom_frame, text="확인", command=dialog.destroy, width=10)
+    btn.pack()
+
+    content_frame = tk.Frame(dialog)
+    content_frame.pack(side="top", expand=True, fill="both", padx=20, pady=10)
+    
+    lines = message.split('\n')
+    truncated_lines = []
+    for line in lines:
+        if len(line) > 55:
+            truncated_lines.append(line[:52] + "...")
+        else:
+            truncated_lines.append(line)
+    display_message = '\n'.join(truncated_lines)
+
+    msg_label = tk.Label(content_frame, text=display_message, justify="center", wraplength=400)
+    msg_label.pack(expand=True, fill="both")
     
     parent.wait_window(dialog)
 
 def ask_search_mode(parent, icon_path):
     dialog = tk.Toplevel(parent)
-    dialog.title("로그 분석 모드 선택")
+    dialog.title("분석 모드 선택")
     
     set_window_icon(dialog, icon_path)
-    dialog.grab_set()
-    dialog.attributes('-topmost', True)
     
-    dialog.geometry("350x180")
+    dialog.attributes('-topmost', True)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.grab_set()
+    
+    dialog.geometry("480x180")
     dialog.resizable(False, False)
     
     dialog.update_idletasks()
@@ -80,7 +103,7 @@ def ask_search_mode(parent, icon_path):
     y = (dialog.winfo_screenheight() - dialog.winfo_reqheight()) // 2
     dialog.geometry(f"+{x}+{y}")
 
-    tk.Label(dialog, text="원하시는 로그 분석 방식을 선택하세요.", font=("", 11, "bold"), pady=15).pack()
+    tk.Label(dialog, text="원하시는 분석 방식을 선택하세요.", font=("", 11, "bold"), pady=15).pack()
 
     mode_result = []
 
@@ -95,8 +118,9 @@ def ask_search_mode(parent, icon_path):
     btn_frame = tk.Frame(dialog)
     btn_frame.pack(pady=10)
     
-    tk.Button(btn_frame, text="자동 로그 분석", height=2, width=15, command=lambda: set_mode('base')).pack(side="left", padx=10)
-    tk.Button(btn_frame, text="로그 검색", height=2, width=15, command=lambda: set_mode('custom')).pack(side="left", padx=10)
+    tk.Button(btn_frame, text="자동 로그 분석", height=2, width=15, command=lambda: set_mode('base'), bg="#e8f4f8").pack(side="left", padx=5)
+    tk.Button(btn_frame, text="로그 검색", height=2, width=15, command=lambda: set_mode('custom'), bg="#e8f4f8").pack(side="left", padx=5)
+    tk.Button(btn_frame, text="EDR 부하 체크", height=2, width=15, command=lambda: set_mode('edr'), bg="#e8f4f8").pack(side="left", padx=5)
 
     dialog.protocol("WM_DELETE_WINDOW", on_cancel)
     parent.wait_window(dialog)
@@ -108,8 +132,11 @@ def ask_search_keywords(parent, icon_path):
     dialog.title("사용자 지정 로그 검색")
     
     set_window_icon(dialog, icon_path)
-    dialog.grab_set()
+    
     dialog.attributes('-topmost', True)
+    dialog.lift()
+    dialog.focus_force()
+    dialog.grab_set()
     
     dialog.geometry("400x300")
     dialog.resizable(False, False)
@@ -122,7 +149,6 @@ def ask_search_keywords(parent, icon_path):
     tk.Label(dialog, text="검색할 로그를 입력하세요 (최대 5개):", pady=10).pack()
     
     entries = []
-    
     for i in range(5):
         frame = tk.Frame(dialog)
         frame.pack(pady=3)
@@ -131,19 +157,16 @@ def ask_search_keywords(parent, icon_path):
         entry = tk.Entry(frame, textvariable=entry_var, width=40)
         entry.pack(side="left", padx=5)
         entries.append(entry_var)
-        
         if i == 0:
             entry.focus_set()
 
     result = []
-
     def on_confirm(event=None):
         valid_keywords = []
         for var in entries:
             val = var.get().strip()
             if val and val not in valid_keywords:
                 valid_keywords.append(val)
-                
         if valid_keywords:
             result.extend(valid_keywords)
             dialog.destroy()
@@ -164,43 +187,304 @@ def ask_search_keywords(parent, icon_path):
     dialog.bind('<Escape>', on_cancel)
 
     parent.wait_window(dialog)
-    
     return result if not (result and result[0] is None) else None
 
-def get_output_filename(tar_filepath):
+def get_output_filename(tar_filepath, prefix="", suffix=""):
     if getattr(sys, 'frozen', False):
         save_dir = os.path.dirname(sys.executable)
     else:
         save_dir = os.path.dirname(os.path.abspath(__file__))
         
     base_name = os.path.basename(tar_filepath)
-    
-    if base_name.endswith('.tar.gz'):
-        name_without_ext = base_name[:-7]
-    elif base_name.endswith('.tgz'):
-        name_without_ext = base_name[:-4]
-    elif base_name.endswith('.tar'):
-        name_without_ext = base_name[:-4]
-    else:
-        name_without_ext = os.path.splitext(base_name)[0]
+    if base_name.endswith('.tar.gz'): name_without_ext = base_name[:-7]
+    elif base_name.endswith('.tgz'): name_without_ext = base_name[:-4]
+    elif base_name.endswith('.tar'): name_without_ext = base_name[:-4]
+    else: name_without_ext = os.path.splitext(base_name)[0]
         
-    output_filename = os.path.join(save_dir, f"{name_without_ext}.html")
+    output_filename = os.path.join(save_dir, f"{prefix}{name_without_ext}{suffix}.html")
     
     counter = 1
     while os.path.exists(output_filename):
-        output_filename = os.path.join(save_dir, f"{name_without_ext}_{counter}.html")
+        output_filename = os.path.join(save_dir, f"{prefix}{name_without_ext}{suffix}_{counter}.html")
         counter += 1
         
     return output_filename
 
+def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
+    stats_content = None
+    
+    try:
+        with tarfile.open(tar_filepath, 'r:*') as tar:
+            for member in tar.getmembers():
+                if member.isfile() and 'stats.log' in member.name:
+                    f = tar.extractfile(member)
+                    if f:
+                        stats_content = f.read().decode('utf-8', errors='ignore')
+                        break
+                        
+        if not stats_content:
+            show_custom_message(root, "분석 실패", "압축 파일 내에서 stats.log 파일을 찾을 수 없습니다.", icon_path)
+            return
+
+        blocks = stats_content.split("--- Events Metadata ---")
+        
+        time_series_data = []
+        for block in blocks[1:]:
+            ts_match = re.search(r'\[(.*?)\]', block)
+            mem_match = re.search(r'Agent Memory: rss: ([\d.]+) MB, vms: ([\d.]+) MB', block)
+            overall_match = re.search(r'Overall amount: (\d+), rate: ([\d.]+) per second', block)
+            
+            if ts_match and mem_match and overall_match:
+                time_series_data.append({
+                    "time": ts_match.group(1),
+                    "rss": float(mem_match.group(1)),
+                    "rate": float(overall_match.group(2))
+                })
+
+        paths_data, binaries, events, queues = [], [], [], []
+        mem_rss, mem_vms = "0", "0"
+        overall_amount, overall_rate = "0", "0"
+        timestamp = "알 수 없음"
+        
+        if len(blocks) > 1:
+            latest_block = blocks[-1]
+            ts_match = re.search(r'\[(.*?)\]', latest_block)
+            if ts_match: timestamp = ts_match.group(1)
+
+            raw_paths = re.findall(r'Destination path: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
+            paths_data = [{"name": p[0], "amount": int(p[1]), "rate": round(float(p[2]), 4)} for p in raw_paths]
+            paths_data = sorted(paths_data, key=lambda x: x['amount'], reverse=True)[:10]
+
+            binaries = re.findall(r'Source path: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
+            events = re.findall(r'Event type: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
+            mem_match = re.search(r'Agent Memory: rss: ([\d.]+) MB, vms: ([\d.]+) MB', latest_block)
+            if mem_match: mem_rss, mem_vms = mem_match.groups()
+                
+            queues = re.findall(r'([a-zA-Z0-9_]+) queue: size: (\d+), enqueue events/sec: (\d+), handle events/sec: (\d+)', latest_block)
+            overall_match = re.search(r'Overall amount: (\d+), rate: ([\d.]+) per second', latest_block)
+            if overall_match: overall_amount, overall_rate = overall_match.groups()
+                
+        binaries_data = sorted([{"name": b[0], "amount": int(b[1])} for b in binaries if int(b[1]) > 0], key=lambda x: x['amount'], reverse=True)[:10]
+
+        events_data = sorted([{"name": e[0], "amount": int(e[1])} for e in events if int(e[1]) > 0], key=lambda x: x['amount'], reverse=True)[:8]
+
+        queue_html = "<tr><th>Queue 이름</th><th>Size</th><th>Enqueue/sec</th><th>Handle/sec</th><th>상태</th></tr>"
+        for q in queues:
+            name, size, enq, handle = q[0], int(q[1]), int(q[2]), int(q[3])
+            is_warning = size > 0 or enq > handle
+            tr_style = "background-color: #fadbd8; color: #c0392b; font-weight: bold;" if is_warning else ""
+            status_text = "병목 의심" if is_warning else "정상"
+            queue_html += f"<tr style='{tr_style}'><td>{name}</td><td>{size}</td><td>{enq}</td><td>{handle}</td><td>{status_text}</td></tr>"
+
+        chart_js_path = get_resource_path(CHART_FILENAME)
+        if os.path.exists(chart_js_path):
+            with open(chart_js_path, 'r', encoding='utf-8') as f:
+                chart_script_tag = f"<script>\n{f.read()}\n</script>"
+        else:
+            chart_script_tag = '<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>'
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html lang="ko">
+        <head>
+            <meta charset="UTF-8">
+            <title>EDR 부하 상태 보고서</title>
+            {chart_script_tag}
+            <style>
+                body {{ font-family: 'Malgun Gothic', sans-serif; background-color: #f4f7f6; color: #333; margin: 20px auto; max-width: 1200px; line-height: 1.4; }}
+                h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; text-align: center; font-size: 1.8em; margin-bottom: 20px; }}
+                .grid-container {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }}
+                .card {{ background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }}
+                .card h2 {{ font-size: 1.2em; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-top: 0; color: #34495e; }}
+                .metric {{ display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #ecf0f1; }}
+                .metric:last-child {{ border-bottom: none; }}
+                .metric-title {{ font-weight: bold; color: #7f8c8d; }}
+                .metric-value {{ font-size: 1.1em; color: #2c3e50; font-weight: bold; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9em; }}
+                th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+                th {{ background-color: #f8f9f9; color: #333; }}
+                .chart-container {{ position: relative; height: 300px; width: 100%; }}
+                .chart-container-large {{ position: relative; height: 350px; width: 100%; }}
+                .full-width {{ grid-column: span 2; }}
+            </style>
+        </head>
+        <body>
+            <h1>EDR 부하 상태 보고서</h1>
+            <div style="text-align:right; margin-bottom: 15px; color:#7f8c8d;">분석 시점(가장 최근 로그): {timestamp}</div>
+            
+            <div class="grid-container">
+                <div class="card full-width">
+                    <h2>리소스 부하 추이</h2>
+                    <div class="chart-container-large">
+                        <canvas id="timeSeriesChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>EDR Agent 리소스 (1시간)</h2>
+                    <div class="metric"><span class="metric-title">메모리 (RSS)</span><span class="metric-value" style="color:#e74c3c;">{mem_rss} MB</span></div>
+                    <div class="metric"><span class="metric-title">메모리 (VMS)</span><span class="metric-value">{mem_vms} MB</span></div>
+                    <div class="metric"><span class="metric-title">전체 발생 이벤트 수</span><span class="metric-value">{overall_amount} 건</span></div>
+                    <div class="metric"><span class="metric-title">이벤트 발생률</span><span class="metric-value">{overall_rate}/sec</span></div>
+                </div>
+
+                <div class="card">
+                    <h2>Queue 처리 상태</h2>
+                    <table>
+                        {queue_html}
+                    </table>
+                </div>
+
+                <div class="card">
+                    <h2>최다 실행 프로세스 (Top 10)</h2>
+                    <div class="chart-container">
+                        <canvas id="binariesChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>발생 이벤트 유형</h2>
+                    <div class="chart-container">
+                        <canvas id="eventsChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="card full-width">
+                    <h2>주요 목적지 경로 (Top 10)</h2>
+                    <table>
+                        <tr><th>Destination Path</th><th>총 발생 건수 (Amount)</th><th>초당 발생률 (Rate)</th></tr>
+                        {''.join([f"<tr><td>{p['name']}</td><td>{p['amount']}</td><td>{p['rate']}</td></tr>" for p in paths_data])}
+                    </table>
+                </div>
+            </div>
+
+            <script>
+                const timeSeriesData = {json.dumps(time_series_data)};
+                const binariesData = {json.dumps(binaries_data)};
+                const eventsData = {json.dumps(events_data)};
+
+                new Chart(document.getElementById('timeSeriesChart'), {{
+                    type: 'line',
+                    data: {{
+                        labels: timeSeriesData.map(d => d.time.substring(5, 16)),
+                        datasets: [
+                            {{
+                                label: 'Memory RSS (MB)',
+                                data: timeSeriesData.map(d => d.rss),
+                                borderColor: '#e74c3c',
+                                backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                                yAxisID: 'y',
+                                fill: true,
+                                tension: 0.3
+                            }},
+                            {{
+                                label: '초당 이벤트 발생률 (Rate)',
+                                data: timeSeriesData.map(d => d.rate),
+                                borderColor: '#3498db',
+                                backgroundColor: 'transparent',
+                                yAxisID: 'y1',
+                                borderDash: [5, 5],
+                                tension: 0.3
+                            }}
+                        ]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: {{ mode: 'index', intersect: false }},
+                        scales: {{
+                            x: {{ ticks: {{ maxTicksLimit: 15 }} }},
+                            y: {{
+                                type: 'linear', 
+                                display: true, 
+                                position: 'left',
+                                beginAtZero: true, 
+                                title: {{ display: true, text: 'Memory (MB)', color: '#e74c3c' }},
+                                ticks: {{
+                                    stepSize: 100
+                                }}
+                            }},
+                            y1: {{
+                                type: 'linear', 
+                                display: true, 
+                                position: 'right',
+                                beginAtZero: true, 
+                                title: {{ display: true, text: 'Event Rate / sec', color: '#3498db' }},
+                                grid: {{ drawOnChartArea: false }}
+                            }}
+                        }}
+                    }}
+                }});
+
+                new Chart(document.getElementById('binariesChart'), {{
+                    type: 'bar',
+                    data: {{
+                        labels: binariesData.map(d => d.name.split('/').pop()),
+                        datasets: [{{
+                            label: '발생 건수',
+                            data: binariesData.map(d => d.amount),
+                            backgroundColor: '#3498db',
+                            borderRadius: 4
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {{
+                            tooltip: {{
+                                callbacks: {{
+                                    title: (context) => binariesData[context[0].dataIndex].name
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+
+                new Chart(document.getElementById('eventsChart'), {{
+                    type: 'doughnut',
+                    data: {{
+                        labels: eventsData.map(d => d.name),
+                        datasets: [{{
+                            data: eventsData.map(d => d.amount),
+                            // [수정] 항목이 8개가 될 수 있으므로 색상 배열에 하나 더 추가 ('#95a5a6')
+                            backgroundColor: ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#34495e', '#e67e22', '#95a5a6']
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        cutout: '60%'
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+
+        with open(output_filepath, "w", encoding="utf-8") as out_f:
+            out_f.write(html_content)
+
+        save_dir = os.path.dirname(output_filepath)
+        success_msg = f"분석이 완료되었습니다.\n\n[저장 경로]\n{save_dir}\n\n확인을 누르면 결과가 열립니다."
+        show_custom_message(root, "분석 완료", success_msg, icon_path)
+        
+        os.startfile(output_filepath)
+
+    except Exception as e:
+        show_custom_message(root, "에러", f"EDR 부하 분석 중 오류가 발생했습니다:\n{str(e)}", icon_path)
+
+
 def select_file_and_search():
     root = tk.Tk()
     
-    icon_path = get_icon_path()
+    icon_path = get_resource_path(ICON_FILENAME)
     set_window_icon(root, icon_path)
     root.withdraw() 
+    
+    root.attributes('-topmost', True)
 
     tar_filepath = filedialog.askopenfilename(
+        parent=root,
         title="로그 파일(.tar.gz)을 선택하세요",
         filetypes=[("Tar Gz files", "*.tar.gz;*.tgz"), ("Tar files", "*.tar"), ("All files", "*.*")]
     )
@@ -215,6 +499,12 @@ def select_file_and_search():
         show_custom_message(root, "안내", "작업이 취소되었습니다.", icon_path)
         root.destroy()
         return
+        
+    if search_mode == 'edr':
+        output_filepath = get_output_filename(tar_filepath, prefix="(resource)_", suffix="_EDR_Load")
+        analyze_edr_load(tar_filepath, output_filepath, root, icon_path)
+        root.destroy()
+        return
 
     final_target_phrases = {}
     
@@ -222,6 +512,7 @@ def select_file_and_search():
         final_target_phrases = BASE_TARGET_PHRASES.copy()
         summary_title = "자동 로그 분석 결과"
         summary_keyword_html = "<p><strong>분석 모드:</strong> 자동 로그 분석</p>"
+        output_filepath = get_output_filename(tar_filepath, prefix="(auto)_")
         
     elif search_mode == 'custom':
         custom_keywords = ask_search_keywords(root, icon_path)
@@ -236,8 +527,7 @@ def select_file_and_search():
         custom_keywords_str = ", ".join(custom_keywords)
         summary_title = "사용자 지정 로그 검색 결과"
         summary_keyword_html = f"<p><strong>검색 키워드:</strong> <span style='color:#c0392b; font-weight:bold;'>{html.escape(custom_keywords_str)}</span> </p>"
-
-    output_filepath = get_output_filename(tar_filepath)
+        output_filepath = get_output_filename(tar_filepath, prefix="(search)_")
     
     phrase_matches = {phrase: [] for phrase in final_target_phrases}
     found_any_global = False
@@ -281,19 +571,41 @@ def select_file_and_search():
             txt_lines.append(f"검색 키워드: {custom_keywords_str}")
         txt_lines.append("=" * 70)
 
-        for phrase, description in final_target_phrases.items():
-            matches = phrase_matches[phrase]
-            if not matches:
-                continue
-            
-            matches.sort(key=lambda x: x[0], reverse=True)
-            txt_lines.append(f"\n[{description}]")
-            txt_lines.append(f"Search Pattern: {phrase}")
-            txt_lines.append("-" * 70)
-            
-            for line, filename in matches:
-                csv_writer.writerow([description, phrase, filename, line])
-                txt_lines.append(f"[{filename}] {line}")
+        file_matches_custom = {}
+
+        if search_mode == 'base':
+            for phrase, description in final_target_phrases.items():
+                matches = phrase_matches[phrase]
+                if not matches:
+                    continue
+                
+                matches.sort(key=lambda x: x[0], reverse=True)
+                txt_lines.append(f"\n[{description}]")
+                txt_lines.append(f"Search Pattern: {phrase}")
+                txt_lines.append("-" * 70)
+                
+                for line, filename in matches:
+                    csv_writer.writerow([description, phrase, filename, line])
+                    txt_lines.append(f"[{filename}] {line}")
+                    
+        elif search_mode == 'custom':
+            for phrase in final_target_phrases:
+                for line, filename in phrase_matches[phrase]:
+                    if filename not in file_matches_custom:
+                        file_matches_custom[filename] = {}
+                    if phrase not in file_matches_custom[filename]:
+                        file_matches_custom[filename][phrase] = []
+                    file_matches_custom[filename][phrase].append(line)
+
+            for filename, p_matches in sorted(file_matches_custom.items()):
+                txt_lines.append(f"\n[{filename}]")
+                txt_lines.append("-" * 70)
+                for phrase, lines in p_matches.items():
+                    lines.sort(reverse=True)
+                    txt_lines.append(f"Search Pattern: {phrase}")
+                    for line in lines:
+                        csv_writer.writerow([final_target_phrases[phrase], phrase, filename, line])
+                        txt_lines.append(line)
 
         csv_data_b64 = base64.b64encode(csv_io.getvalue().encode('utf-8-sig')).decode('utf-8')
         txt_data_b64 = base64.b64encode("\n".join(txt_lines).encode('utf-8')).decode('utf-8')
@@ -318,7 +630,7 @@ def select_file_and_search():
                 .card-header {{ background: #34495e; color: #fff; padding: 8px 15px; font-weight: bold; font-size: 1.05em; display: flex; justify-content: space-between; align-items: center; }}
                 .badge {{ background: #e74c3c; padding: 2px 8px; border-radius: 12px; font-size: 0.75em; font-weight: normal; }}
                 .card-body {{ padding: 12px 15px; }}
-                .pattern {{ color: #c0392b; font-weight: bold; margin-bottom: 8px; display: inline-block; background: #fadbd8; padding: 3px 8px; border-radius: 3px; font-size: 0.9em; }}
+                .pattern {{ color: #c0392b; font-weight: bold; margin-bottom: 8px; margin-top: 8px; display: inline-block; background: #fadbd8; padding: 3px 8px; border-radius: 3px; font-size: 0.9em; }}
                 .filename {{ font-weight: bold; color: #2980b9; margin: 8px 0 4px 0; font-size: 0.95em; border-bottom: 1px dashed #bdc3c7; padding-bottom: 2px; }}
                 .log-line {{ background: #ecf0f1; padding: 6px 10px; border-left: 3px solid #95a5a6; margin-bottom: 4px; font-family: 'Consolas', monospace; font-size: 0.85em; word-break: break-all; color: #2c3e50; }}
                 .omitted {{ color: #7f8c8d; font-style: italic; margin-top: 10px; font-size: 0.85em; background: #fdfefe; padding: 10px; border: 1px solid #e5e8e8; border-radius: 3px; text-align: center; }}
@@ -347,48 +659,80 @@ def select_file_and_search():
         if not found_any_global:
             html_content += f'<div class="no-error">일치하는 로그가 없습니다.</div>'
         else:
-            for phrase, description in final_target_phrases.items():
-                matches = phrase_matches[phrase]
-                if not matches:
-                    continue 
-                
-                matches.sort(key=lambda x: x[0], reverse=True)
-                total_count = len(matches)
-                top_matches = matches[:MAX_PRINT_COUNT]
-                
-                html_content += f"""
-                <div class="card">
-                    <div class="card-header">
-                        <span>[{description}]</span>
-                        <span class="badge">총 {total_count}건 발견</span>
-                    </div>
-                    <div class="card-body">
-                        <div class="pattern">Search Pattern: {html.escape(phrase)}</div>
-                """
-                
-                grouped_matches = {}
-                for line, filename in top_matches:
-                    if filename not in grouped_matches:
-                        grouped_matches[filename] = []
-                    grouped_matches[filename].append(line)
+            if search_mode == 'base':
+                for phrase, description in final_target_phrases.items():
+                    matches = phrase_matches[phrase]
+                    if not matches:
+                        continue 
                     
-                for filename, lines in grouped_matches.items():
-                    html_content += f'<div class="filename">[{html.escape(filename)}]</div>'
-                    for line in lines:
-                        safe_line = html.escape(line)
-                        html_content += f'<div class="log-line">{safe_line}</div>'
-                        
-                if total_count > MAX_PRINT_COUNT:
+                    matches.sort(key=lambda x: x[0], reverse=True)
+                    total_count = len(matches)
+                    top_matches = matches[:MAX_PRINT_COUNT]
+                    
                     html_content += f"""
-                        <div class="omitted">
-                            최신 {MAX_PRINT_COUNT}건만 표시됩니다. 생략된 {total_count - MAX_PRINT_COUNT}건의 로그는 <b>상단 다운로드 버튼</b>을 통해 전체 확인이 가능합니다.
+                    <div class="card">
+                        <div class="card-header">
+                            <span>[{description}]</span>
+                            <span class="badge">총 {total_count}건 발견</span>
                         </div>
+                        <div class="card-body">
+                            <div class="pattern">Search Pattern: {html.escape(phrase)}</div>
                     """
                     
-                html_content += """
+                    grouped_matches = {}
+                    for line, filename in top_matches:
+                        if filename not in grouped_matches:
+                            grouped_matches[filename] = []
+                        grouped_matches[filename].append(line)
+                        
+                    for filename, lines in grouped_matches.items():
+                        html_content += f'<div class="filename">[{html.escape(filename)}]</div>'
+                        for line in lines:
+                            safe_line = html.escape(line)
+                            html_content += f'<div class="log-line">{safe_line}</div>'
+                            
+                    if total_count > MAX_PRINT_COUNT:
+                        html_content += f"""
+                            <div class="omitted">
+                                최신 {MAX_PRINT_COUNT}건만 표시됩니다. 생략된 {total_count - MAX_PRINT_COUNT}건의 로그는 <b>상단 다운로드 버튼</b>을 통해 전체 확인이 가능합니다.
+                            </div>
+                        """
+                        
+                    html_content += """
+                        </div>
                     </div>
-                </div>
-                """
+                    """
+            
+            elif search_mode == 'custom':
+                for filename, p_matches in sorted(file_matches_custom.items()):
+                    total_count = sum(len(lines) for lines in p_matches.values())
+                    html_content += f"""
+                    <div class="card">
+                        <div class="card-header">
+                            <span>[{html.escape(filename)}]</span>
+                            <span class="badge">총 {total_count}건 발견</span>
+                        </div>
+                        <div class="card-body">
+                    """
+                    
+                    for phrase, lines in p_matches.items():
+                        html_content += f'<div class="pattern">Search Pattern: {html.escape(phrase)}</div>'
+                        top_lines = lines[:MAX_PRINT_COUNT]
+                        for line in top_lines:
+                            safe_line = html.escape(line)
+                            html_content += f'<div class="log-line">{safe_line}</div>'
+                            
+                        if len(lines) > MAX_PRINT_COUNT:
+                            html_content += f"""
+                            <div class="omitted">
+                                '{html.escape(phrase)}' 패턴의 최신 {MAX_PRINT_COUNT}건만 표시됩니다. 생략된 {len(lines) - MAX_PRINT_COUNT}건의 로그는 <b>상단 다운로드 버튼</b>을 통해 전체 확인이 가능합니다.
+                            </div>
+                            """
+                            
+                    html_content += """
+                        </div>
+                    </div>
+                    """
 
         base_name_for_dl = os.path.splitext(os.path.basename(output_filepath))[0]
         
