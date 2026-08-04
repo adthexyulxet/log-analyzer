@@ -9,6 +9,7 @@ import io
 import base64
 import re
 import json
+from datetime import datetime, timedelta
 
 MAX_PRINT_COUNT = 10
 ICON_FILENAME = "my_icon.ico"
@@ -211,70 +212,220 @@ def get_output_filename(tar_filepath, prefix="", suffix=""):
     return output_filename
 
 def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
-    stats_content = None
+    stats_content = ""
     
     try:
         with tarfile.open(tar_filepath, 'r:*') as tar:
+            stats_members = []
+            
+            # 1. 압축 파일 내의 모든 stats*.log 파일 찾기
             for member in tar.getmembers():
-                if member.isfile() and 'stats.log' in member.name:
-                    f = tar.extractfile(member)
-                    if f:
-                        stats_content = f.read().decode('utf-8', errors='ignore')
-                        break
+                if member.isfile():
+                    match = re.search(r'stats(?:\.(\d+))?\.log', member.name)
+                    if match:
+                        idx = int(match.group(1)) if match.group(1) else 0
+                        stats_members.append((idx, member))
                         
-        if not stats_content:
-            show_custom_message(root, "분석 실패", "압축 파일 내에서 stats.log 파일을 찾을 수 없습니다.", icon_path)
-            return
+            if not stats_members:
+                show_custom_message(root, "분석 실패", "압축 파일 내에서 stats.log 파일을 찾을 수 없습니다.", icon_path)
+                return
+
+            # 2. 시간순 정렬
+            stats_members.sort(key=lambda x: x[0], reverse=True)
+
+            # 3. 파일 병합
+            for idx, member in stats_members:
+                f = tar.extractfile(member)
+                if f:
+                    stats_content += f.read().decode('utf-8', errors='ignore') + "\n"
 
         blocks = stats_content.split("--- Events Metadata ---")
         
-        time_series_data = []
+        if len(blocks) <= 1:
+            show_custom_message(root, "분석 실패", "유효한 이벤트 메타데이터를 찾을 수 없습니다.", icon_path)
+            return
+
+        # 4. 각 블록의 시간 파싱 및 최근 7일 데이터 필터링
+        parsed_blocks = []
+        latest_dt = None
+        
         for block in blocks[1:]:
             ts_match = re.search(r'\[(.*?)\]', block)
-            mem_match = re.search(r'Agent Memory: rss: ([\d.]+) MB, vms: ([\d.]+) MB', block)
-            overall_match = re.search(r'Overall amount: (\d+), rate: ([\d.]+) per second', block)
+            if not ts_match:
+                continue
+            ts_str = ts_match.group(1)
             
-            if ts_match and mem_match and overall_match:
-                time_series_data.append({
-                    "time": ts_match.group(1),
-                    "rss": float(mem_match.group(1)),
-                    "rate": float(overall_match.group(2))
-                })
+            dt = None
+            try:
+                dt = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                try:
+                    dt = datetime.strptime(ts_str[:15], "%b %d %H:%M:%S")
+                    dt = dt.replace(year=datetime.now().year)
+                except ValueError:
+                    pass
+                    
+            parsed_blocks.append({
+                'block': block,
+                'ts_str': ts_str,
+                'dt': dt
+            })
+            
+            if dt:
+                if latest_dt is None or dt > latest_dt:
+                    latest_dt = dt
+                    
+        # 최근 7일 데이터만 남기기
+        if latest_dt:
+            seven_days_ago = latest_dt - timedelta(days=7)
+            filtered_blocks = [pb for pb in parsed_blocks if pb['dt'] is None or pb['dt'] >= seven_days_ago]
+        else:
+            filtered_blocks = parsed_blocks
 
-        paths_data, binaries, events, queues = [], [], [], []
-        mem_rss, mem_vms = "0", "0"
-        overall_amount, overall_rate = "0", "0"
-        timestamp = "알 수 없음"
+        # 5. 차트 및 분석 데이터 추출
+        time_series_data = []
+        queue_series_data = []
+        queue_bottleneck_stats = {}
         
-        if len(blocks) > 1:
-            latest_block = blocks[-1]
-            ts_match = re.search(r'\[(.*?)\]', latest_block)
-            if ts_match: timestamp = ts_match.group(1)
+        paths_dict = {}
+        binaries_dict = {}
+        events_dict = {}
 
-            raw_paths = re.findall(r'Destination path: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
-            paths_data = [{"name": p[0], "amount": int(p[1]), "rate": round(float(p[2]), 4)} for p in raw_paths]
-            paths_data = sorted(paths_data, key=lambda x: x['amount'], reverse=True)[:10]
+        total_rss, max_rss = 0.0, 0.0
+        total_vms, max_vms = 0.0, 0.0
+        total_rate, max_rate = 0.0, 0.0
+        total_amt, max_amt = 0, 0
+        resource_count = 0
 
-            binaries = re.findall(r'Source path: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
-            events = re.findall(r'Event type: (.*?), amount: (\d+), rate: ([\d.]+)', latest_block)
-            mem_match = re.search(r'Agent Memory: rss: ([\d.]+) MB, vms: ([\d.]+) MB', latest_block)
-            if mem_match: mem_rss, mem_vms = mem_match.groups()
+        # ========== [속도 최적화] 정규식을 반복문 밖에서 미리 컴파일 ==========
+        re_mem = re.compile(r'Agent Memory: rss: ([\d.]+) MB, vms: ([\d.]+) MB')
+        re_overall = re.compile(r'Overall amount: (\d+), rate: ([\d.]+) per second')
+        re_q = re.compile(r'([a-zA-Z0-9_]+) queue: size: (\d+), enqueue events/sec: (\d+), handle events/sec: (\d+)')
+        re_dest = re.compile(r'Destination path: (.*?), amount: (\d+), rate: ([\d.]+)')
+        re_src = re.compile(r'Source path: (.*?), amount: (\d+), rate: ([\d.]+)')
+        re_evt = re.compile(r'Event type: (.*?), amount: (\d+), rate: ([\d.]+)')
+
+        for pb in filtered_blocks:
+            block = pb['block']
+            ts_str = pb['ts_str']
+            
+            # --- 시계열 데이터 및 리소스 추출 ---
+            mem_match = re_mem.search(block)
+            overall_match = re_overall.search(block)
+            
+            if mem_match and overall_match:
+                rss = float(mem_match.group(1))
+                vms = float(mem_match.group(2))
+                amt = int(overall_match.group(1))
+                rate = float(overall_match.group(2))
+
+                time_series_data.append({
+                    "time": ts_str,
+                    "rss": rss,
+                    "rate": rate
+                })
                 
-            queues = re.findall(r'([a-zA-Z0-9_]+) queue: size: (\d+), enqueue events/sec: (\d+), handle events/sec: (\d+)', latest_block)
-            overall_match = re.search(r'Overall amount: (\d+), rate: ([\d.]+) per second', latest_block)
-            if overall_match: overall_amount, overall_rate = overall_match.groups()
+                total_rss += rss
+                max_rss = max(max_rss, rss)
+                total_vms += vms
+                max_vms = max(max_vms, vms)
+                total_amt += amt
+                max_amt = max(max_amt, amt)
+                total_rate += rate
+                max_rate = max(max_rate, rate)
+                resource_count += 1
+
+            # --- 시계열 Queue 데이터 및 병목 요약 추출 ---
+            q_matches = re_q.findall(block)
+            for q in q_matches:
+                q_name, size, enq, handle = q[0], int(q[1]), int(q[2]), int(q[3])
                 
-        binaries_data = sorted([{"name": b[0], "amount": int(b[1])} for b in binaries if int(b[1]) > 0], key=lambda x: x['amount'], reverse=True)[:10]
+                if size > 0 or enq > 0 or handle > 0:
+                    queue_series_data.append({
+                        "time": ts_str,
+                        "name": q_name,
+                        "size": size,
+                        "enq": enq,
+                        "handle": handle
+                    })
 
-        events_data = sorted([{"name": e[0], "amount": int(e[1])} for e in events if int(e[1]) > 0], key=lambda x: x['amount'], reverse=True)[:8]
+                if q_name not in queue_bottleneck_stats:
+                    queue_bottleneck_stats[q_name] = {'total': 0, 'bottleneck': 0, 'max_size': 0}
+                
+                queue_bottleneck_stats[q_name]['total'] += 1
+                if size > 0 or enq > handle:
+                    queue_bottleneck_stats[q_name]['bottleneck'] += 1
+                
+                if size > queue_bottleneck_stats[q_name]['max_size']:
+                    queue_bottleneck_stats[q_name]['max_size'] = size
 
-        queue_html = "<tr><th>Queue 이름</th><th>Size</th><th>Enqueue/sec</th><th>Handle/sec</th><th>상태</th></tr>"
-        for q in queues:
-            name, size, enq, handle = q[0], int(q[1]), int(q[2]), int(q[3])
-            is_warning = size > 0 or enq > handle
+            # --- 7일치 데이터 누적 합산 ---
+            for p in re_dest.findall(block):
+                name, amt, rate = p[0], int(p[1]), float(p[2])
+                if name not in paths_dict:
+                    paths_dict[name] = {"amount": 0, "rate_sum": 0.0, "count": 0}
+                paths_dict[name]["amount"] += amt
+                paths_dict[name]["rate_sum"] += rate
+                paths_dict[name]["count"] += 1
+
+            for b in re_src.findall(block):
+                name, amt = b[0], int(b[1])
+                binaries_dict[name] = binaries_dict.get(name, 0) + amt
+
+            for e in re_evt.findall(block):
+                name, amt = e[0], int(e[1])
+                events_dict[name] = events_dict.get(name, 0) + amt
+
+        # --- 데이터 정렬 ---
+        paths_data = [{"name": k, "amount": v["amount"], "rate": round(v["rate_sum"] / v["count"], 4)} for k, v in paths_dict.items()]
+        paths_data = sorted(paths_data, key=lambda x: x['amount'], reverse=True)[:10]
+
+        binaries_data = [{"name": k, "amount": v} for k, v in binaries_dict.items() if v > 0]
+        binaries_data = sorted(binaries_data, key=lambda x: x['amount'], reverse=True)[:10]
+
+        events_data = [{"name": k, "amount": v} for k, v in events_dict.items() if v > 0]
+        events_data = sorted(events_data, key=lambda x: x['amount'], reverse=True)[:8]
+
+        avg_rss = round(total_rss / resource_count, 1) if resource_count > 0 else 0
+        avg_vms = round(total_vms / resource_count, 1) if resource_count > 0 else 0
+        avg_amt = round(total_amt / resource_count, 1) if resource_count > 0 else 0
+        avg_rate = round(total_rate / resource_count, 2) if resource_count > 0 else 0
+
+        start_timestamp = "알 수 없음"
+        end_timestamp = "알 수 없음"
+        if filtered_blocks:
+            start_timestamp = filtered_blocks[0]['ts_str']
+            end_timestamp = filtered_blocks[-1]['ts_str']
+
+        # --- HTML 생성 ---
+        sorted_queue_stats = sorted(queue_bottleneck_stats.items(), key=lambda x: (x[1]['bottleneck'], x[1]['max_size']), reverse=True)
+        
+        queue_summary_html = "<tr><th>Queue 이름</th><th>병목 발생 횟수 / 전체 기록</th><th>병목 비율(%)</th><th>7일 내 최대 Size</th></tr>"
+        if not sorted_queue_stats:
+            queue_summary_html += "<tr><td colspan='4' style='text-align:center;'>큐 데이터가 없습니다.</td></tr>"
+        else:
+            for q_name, stats in sorted_queue_stats:
+                total = stats['total']
+                bottleneck = stats['bottleneck']
+                max_size = stats['max_size']
+                
+                if total == 0: continue
+                
+                ratio = (bottleneck / total) * 100
+                is_warning = bottleneck > 0
+                tr_style = "background-color: #fadbd8; color: #c0392b; font-weight: bold;" if is_warning else ""
+                
+                queue_summary_html += f"<tr style='{tr_style}'><td>{q_name}</td><td>{bottleneck} / {total}</td><td>{ratio:.1f}%</td><td>{max_size}</td></tr>"
+
+        queue_detail_html = ""
+        for d in reversed(queue_series_data):
+            is_warning = d['size'] > 0 or d['enq'] > d['handle']
             tr_style = "background-color: #fadbd8; color: #c0392b; font-weight: bold;" if is_warning else ""
             status_text = "병목 의심" if is_warning else "정상"
-            queue_html += f"<tr style='{tr_style}'><td>{name}</td><td>{size}</td><td>{enq}</td><td>{handle}</td><td>{status_text}</td></tr>"
+            queue_detail_html += f"<tr style='{tr_style}'><td>{d['time']}</td><td>{d['name']}</td><td>{d['size']}</td><td>{d['enq']}</td><td>{d['handle']}</td><td>{status_text}</td></tr>"
+
+        if not queue_detail_html:
+            queue_detail_html = "<tr><td colspan='6' style='text-align:center;'>활성화된 큐 데이터가 없습니다.</td></tr>"
 
         chart_js_path = get_resource_path(CHART_FILENAME)
         if os.path.exists(chart_js_path):
@@ -306,55 +457,88 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                 .chart-container {{ position: relative; height: 300px; width: 100%; }}
                 .chart-container-large {{ position: relative; height: 350px; width: 100%; }}
                 .full-width {{ grid-column: span 2; }}
+                .table-scroll {{ max-height: 400px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; }}
+                .table-scroll th {{ position: sticky; top: 0; z-index: 1; outline: 1px solid #ddd; }}
             </style>
         </head>
         <body>
             <h1>EDR 부하 상태 보고서</h1>
-            <div style="text-align:right; margin-bottom: 15px; color:#7f8c8d;">분석 시점(가장 최근 로그): {timestamp}</div>
+            <div style="text-align:right; margin-bottom: 15px; color:#7f8c8d;"><strong>분석 기간 (최근 7일):</strong> {start_timestamp} ~ {end_timestamp}</div>
             
             <div class="grid-container">
                 <div class="card full-width">
-                    <h2>리소스 부하 추이</h2>
+                    <h2>리소스 부하 추이 (최근 7일)</h2>
                     <div class="chart-container-large">
                         <canvas id="timeSeriesChart"></canvas>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h2>EDR Agent 리소스 (1시간)</h2>
-                    <div class="metric"><span class="metric-title">메모리 (RSS)</span><span class="metric-value" style="color:#e74c3c;">{mem_rss} MB</span></div>
-                    <div class="metric"><span class="metric-title">메모리 (VMS)</span><span class="metric-value">{mem_vms} MB</span></div>
-                    <div class="metric"><span class="metric-title">전체 발생 이벤트 수</span><span class="metric-value">{overall_amount} 건</span></div>
-                    <div class="metric"><span class="metric-title">이벤트 발생률</span><span class="metric-value">{overall_rate}/sec</span></div>
+                    <h2>EDR Agent 리소스 요약 (최근 7일)</h2>
+                    <div class="metric"><span class="metric-title">메모리 RSS (평균 / 최대)</span><span class="metric-value"><span style="font-weight:normal; color:#7f8c8d;">{avg_rss} MB / </span><span style="color:#e74c3c;">{max_rss} MB</span></span></div>
+                    <div class="metric"><span class="metric-title">메모리 VMS (평균 / 최대)</span><span class="metric-value"><span style="font-weight:normal; color:#7f8c8d;">{avg_vms} MB / </span>{max_vms} MB</span></div>
+                    <div class="metric"><span class="metric-title">이벤트 수 (평균 / 최대)</span><span class="metric-value"><span style="font-weight:normal; color:#7f8c8d;">{avg_amt} 건 / </span>{max_amt} 건</span></div>
+                    <div class="metric"><span class="metric-title">초당 이벤트 (평균 / 최대)</span><span class="metric-value"><span style="font-weight:normal; color:#7f8c8d;">{avg_rate}/sec / </span>{max_rate}/sec</span></div>
                 </div>
 
                 <div class="card">
-                    <h2>Queue 처리 상태</h2>
+                    <h2>Queue 병목 발생 요약 (최근 7일)</h2>
                     <table>
-                        {queue_html}
+                        {queue_summary_html}
                     </table>
                 </div>
 
                 <div class="card">
-                    <h2>최다 실행 프로세스 (Top 10)</h2>
+                    <h2>최다 실행 프로세스 (최근 7일 누적 Top 10)</h2>
                     <div class="chart-container">
                         <canvas id="binariesChart"></canvas>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h2>발생 이벤트 유형</h2>
+                    <h2>발생 이벤트 유형 (최근 7일 누적)</h2>
                     <div class="chart-container">
                         <canvas id="eventsChart"></canvas>
                     </div>
                 </div>
 
                 <div class="card full-width">
-                    <h2>주요 목적지 경로 (Top 10)</h2>
+                    <h2>주요 목적지 경로 (최근 7일 누적 Top 10)</h2>
                     <table>
-                        <tr><th>Destination Path</th><th>총 발생 건수 (Amount)</th><th>초당 발생률 (Rate)</th></tr>
+                        <tr><th>Destination Path</th><th>7일 총 누적 건수 (Amount)</th><th>평균 초당 발생률 (Avg Rate)</th></tr>
                         {''.join([f"<tr><td>{p['name']}</td><td>{p['amount']}</td><td>{p['rate']}</td></tr>" for p in paths_data])}
                     </table>
+                </div>
+
+                <div class="card full-width">
+                    <h2>리소스 부하 추이 상세 데이터 (최근 7일)</h2>
+                    <div class="table-scroll">
+                        <table>
+                            <tr>
+                                <th>시간 (Time)</th>
+                                <th>메모리 RSS (MB)</th>
+                                <th>초당 이벤트 발생률 (Rate / sec)</th>
+                            </tr>
+                            {''.join([f"<tr><td>{d['time']}</td><td>{d['rss']}</td><td>{d['rate']}</td></tr>" for d in reversed(time_series_data)])}
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card full-width">
+                    <h2>Queue 처리 상태 상세 데이터 (최근 7일, 활성 상태 이력 한정)</h2>
+                    <div class="table-scroll">
+                        <table>
+                            <tr>
+                                <th>시간 (Time)</th>
+                                <th>Queue 이름</th>
+                                <th>Size</th>
+                                <th>Enqueue/sec</th>
+                                <th>Handle/sec</th>
+                                <th>상태</th>
+                            </tr>
+                            {queue_detail_html}
+                        </table>
+                    </div>
                 </div>
             </div>
 
@@ -375,7 +559,8 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                                 backgroundColor: 'rgba(231, 76, 60, 0.1)',
                                 yAxisID: 'y',
                                 fill: true,
-                                tension: 0.3
+                                tension: 0.3,
+                                pointRadius: 0
                             }},
                             {{
                                 label: '초당 이벤트 발생률 (Rate)',
@@ -383,8 +568,8 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                                 borderColor: '#3498db',
                                 backgroundColor: 'transparent',
                                 yAxisID: 'y1',
-                                borderDash: [5, 5],
-                                tension: 0.3
+                                tension: 0.3,
+                                pointRadius: 0
                             }}
                         ]
                     }},
@@ -400,9 +585,7 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                                 position: 'left',
                                 beginAtZero: true, 
                                 title: {{ display: true, text: 'Memory (MB)', color: '#e74c3c' }},
-                                ticks: {{
-                                    stepSize: 100
-                                }}
+                                ticks: {{ stepSize: 100 }}
                             }},
                             y1: {{
                                 type: 'linear', 
@@ -421,7 +604,7 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                     data: {{
                         labels: binariesData.map(d => d.name.split('/').pop()),
                         datasets: [{{
-                            label: '발생 건수',
+                            label: '누적 발생 건수',
                             data: binariesData.map(d => d.amount),
                             backgroundColor: '#3498db',
                             borderRadius: 4
@@ -446,7 +629,6 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
                         labels: eventsData.map(d => d.name),
                         datasets: [{{
                             data: eventsData.map(d => d.amount),
-                            // [수정] 항목이 8개가 될 수 있으므로 색상 배열에 하나 더 추가 ('#95a5a6')
                             backgroundColor: ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#34495e', '#e67e22', '#95a5a6']
                         }}]
                     }},
@@ -472,7 +654,6 @@ def analyze_edr_load(tar_filepath, output_filepath, root, icon_path):
 
     except Exception as e:
         show_custom_message(root, "에러", f"EDR 부하 분석 중 오류가 발생했습니다:\n{str(e)}", icon_path)
-
 
 def select_file_and_search():
     root = tk.Tk()
